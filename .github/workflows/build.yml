@@ -16,12 +16,14 @@ jobs:
       - name: কোড চেকআউট করা
         uses: actions/checkout@v4
 
-      - name: whisper.cpp সাবমডিউল যোগ করা (যদি আগে থেকে না থাকে)
+      - name: whisper.cpp সাবমডিউল যোগ করা
         run: |
-          if [ ! -f app/src/main/cpp/whisper.cpp/CMakeLists.txt ]; then
-            rm -rf app/src/main/cpp/whisper.cpp
-            git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
-          fi
+          rm -rf app/src/main/cpp/whisper.cpp
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
+          echo "ক্লোন যাচাই করা হচ্ছে:"
+          ls -la app/src/main/cpp/whisper.cpp/
+          test -f app/src/main/cpp/whisper.cpp/CMakeLists.txt || (echo "❌ Clone ব্যর্থ হয়েছে!" && exit 1)
+          test -f app/src/main/cpp/whisper.cpp/models/requirements-convert-hf-to-ggml.txt || (echo "❌ requirements ফাইল পাওয়া যায়নি!" && exit 1)
 
       - name: JDK 17 সেটআপ
         uses: actions/setup-java@v4

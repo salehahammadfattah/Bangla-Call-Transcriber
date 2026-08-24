@@ -1,0 +1,85 @@
+name: Build Bangla Call Transcriber APK
+
+# ম্যানুয়ালি GitHub-এর "Actions" ট্যাব থেকে "Run workflow" চাপলে চলবে,
+# অথবা main ব্রাঞ্চে পুশ করলে অটোমেটিক চলবে।
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: কোড চেকআউট করা
+        uses: actions/checkout@v4
+
+      - name: whisper.cpp সাবমডিউল যোগ করা (যদি আগে থেকে না থাকে)
+        run: |
+          if [ ! -f app/src/main/cpp/whisper.cpp/CMakeLists.txt ]; then
+            rm -rf app/src/main/cpp/whisper.cpp
+            git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
+          fi
+
+      - name: JDK 17 সেটআপ
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Android SDK সেটআপ
+        uses: android-actions/setup-android@v3
+
+      - name: NDK ও CMake ইনস্টল
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Python সেটআপ (মডেল কনভার্সনের জন্য)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: বাংলা Whisper মডেল ডাউনলোড ও GGML-এ কনভার্ট করা
+        run: |
+          pip install -r app/src/main/cpp/whisper.cpp/models/requirements-convert-hf-to-ggml.txt
+          pip install huggingface_hub
+
+          mkdir -p models_work
+          python app/src/main/cpp/whisper.cpp/models/convert-h5-to-ggml.py \
+            bangla-speech-processing/BanglaASR \
+            ./models_work/bangla-ggml \
+            app/src/main/cpp/whisper.cpp
+
+          # কনভার্ট করা ফাইলের নাম বের করে bangla-whisper.bin নামে রাখা
+          find ./models_work -name "*.bin" -exec cp {} ./bangla-whisper.bin \;
+          ls -la ./bangla-whisper.bin
+
+      - name: মডেল অ্যাপের assets ফোল্ডারে বসানো
+        run: |
+          mkdir -p app/src/main/assets/models
+          cp bangla-whisper.bin app/src/main/assets/models/bangla-whisper.bin
+
+      - name: Gradle দিয়ে assets থেকে ফাইলে কপি করার লজিক যোগ (প্রথমবার চালুতে)
+        run: echo "মডেল assets/models/bangla-whisper.bin এ আছে; MainActivity প্রথম রানে এটা internal storage এ কপি করবে (নিচের নোট দ্রষ্টব্য)"
+
+      - name: Gradle wrapper এক্সিকিউটেবল করা
+        run: |
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x gradlew
+
+      - name: Debug APK বিল্ড করা
+        run: ./gradlew assembleDebug --stacktrace
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+
+      - name: APK আপলোড করা (এখান থেকে ডাউনলোড করবে)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanglaCallTranscriber-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30

@@ -1,7 +1,5 @@
-name: Build Bangla Call Transcriber APK
+name: Build and Fix Bangla Call Transcriber APK
 
-# GitHub Actions থেকে Run workflow করা যাবে,
-# অথবা main branch-এ push করলে অটোমেটিক build হবে।
 on:
   workflow_dispatch:
   push:
@@ -16,23 +14,462 @@ jobs:
       - name: কোড চেকআউট করা
         uses: actions/checkout@v4
 
-      # whisper.cpp-এর বর্তমান source checkout করা হবে।
-      # পুরোনো/অসম্পূর্ণ local copy থাকলে সরিয়ে নতুন করে clone করি।
+      # ১. Android Project-এর প্রয়োজনীয় কোড ফাইলগুলো স্বয়ংক্রিয়ভাবে তৈরি / ওভাররাইট করা
+      - name: প্রজেক্ট ফাইলসমূহ তৈরি ও আপডেট করা
+        run: |
+          # ডিরেক্টরি তৈরি
+          mkdir -p app/src/main/java/com/example/banglacalltranscriber
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/cpp
+
+          # AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.banglacalltranscriber">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="বাংলা কল ট্রান্সক্রাইবার"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.BanglaCallTranscriber">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF
+
+          # AudioRecorder.kt
+          cat << 'EOF' > app/src/main/java/com/example/banglacalltranscriber/AudioRecorder.kt
+          package com.example.banglacalltranscriber
+
+          import android.annotation.SuppressLint
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.util.Log
+
+          class AudioRecorder(private val onAudioChunkReady: (FloatArray) -> Unit) {
+
+              private val sampleRate = 16000
+              private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+              private val audioEncoding = AudioFormat.ENCODING_PCM_16BIT
+
+              private var audioRecord: AudioRecord? = null
+              private var isRecording = false
+              private var recordingThread: Thread? = null
+
+              @SuppressLint("MissingPermission")
+              fun startRecording() {
+                  val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioEncoding)
+                  val bufferSize = Math.max(minBufferSize, sampleRate * 2)
+
+                  audioRecord = AudioRecord(
+                      MediaRecorder.AudioSource.MIC,
+                      sampleRate,
+                      channelConfig,
+                      audioEncoding,
+                      bufferSize
+                  )
+
+                  if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                      Log.e("AudioRecorder", "AudioRecord initialization failed")
+                      return
+                  }
+
+                  audioRecord?.startRecording()
+                  isRecording = true
+
+                  recordingThread = Thread {
+                      val buffer = ShortArray(bufferSize)
+                      while (isRecording) {
+                          val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                          if (read > 0) {
+                              val floatBuffer = FloatArray(read)
+                              for (i in 0 until read) {
+                                  floatBuffer[i] = buffer[i] / 32768.0f
+                              }
+                              onAudioChunkReady(floatBuffer)
+                          }
+                      }
+                  }
+                  recordingThread?.start()
+              }
+
+              fun stopRecording() {
+                  isRecording = false
+                  try {
+                      audioRecord?.stop()
+                      audioRecord?.release()
+                  } catch (e: Exception) {
+                      Log.e("AudioRecorder", "Error stopping recorder", e)
+                  }
+                  audioRecord = null
+                  recordingThread = null
+              }
+          }
+          EOF
+
+          # WhisperEngine.kt
+          cat << 'EOF' > app/src/main/java/com/example/banglacalltranscriber/WhisperEngine.kt
+          package com.example.banglacalltranscriber
+
+          import android.content.Context
+          import android.util.Log
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class WhisperEngine(private val context: Context) {
+
+              private var contextPtr: Long = 0
+
+              init {
+                  System.loadLibrary("whisper_native")
+              }
+
+              fun initialize(): Boolean {
+                  val modelPath = copyModelFromAssetsIfNeeded()
+                  if (modelPath.isEmpty()) {
+                      Log.e("WhisperEngine", "Model path is empty.")
+                      return false
+                  }
+                  contextPtr = initNativeModel(modelPath)
+                  return contextPtr != 0L
+              }
+
+              private fun copyModelFromAssetsIfNeeded(): String {
+                  val file = File(context.filesDir, "bangla-whisper.bin")
+                  if (file.exists() && file.length() > 0) {
+                      return file.absolutePath
+                  }
+
+                  return try {
+                      context.assets.open("models/bangla-whisper.bin").use { input ->
+                          FileOutputStream(file).use { output ->
+                              input.copyTo(output)
+                          }
+                      }
+                      file.absolutePath
+                  } catch (e: Exception) {
+                      Log.e("WhisperEngine", "Failed to copy model from assets", e)
+                      ""
+                  }
+              }
+
+              fun transcribe(samples: FloatArray): String {
+                  if (contextPtr == 0L) return ""
+                  return transcribeNative(contextPtr, samples)
+              }
+
+              fun release() {
+                  if (contextPtr != 0L) {
+                      freeNativeModel(contextPtr)
+                      contextPtr = 0L
+                  }
+              }
+
+              private external fun initNativeModel(modelPath: String): Long
+              private external fun transcribeNative(contextPtr: Long, samples: FloatArray): String
+              private external fun freeNativeModel(contextPtr: Long)
+          }
+          EOF
+
+          # MainActivity.kt
+          cat << 'EOF' > app/src/main/java/com/example/banglacalltranscriber/MainActivity.kt
+          package com.example.banglacalltranscriber
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import java.util.concurrent.Executors
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var btnToggle: Button
+              private lateinit var tvStatus: TextView
+              private lateinit var tvResult: TextView
+
+              private var isTranscribing = false
+              private lateinit var audioRecorder: AudioRecorder
+              private lateinit var whisperEngine: WhisperEngine
+              private val executor = Executors.newSingleThreadExecutor()
+
+              private val PERMISSION_REQUEST_CODE = 1001
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  btnToggle = findViewById(R.id.btnToggle)
+                  tvStatus = findViewById(R.id.tvStatus)
+                  tvResult = findViewById(R.id.tvResult)
+
+                  whisperEngine = WhisperEngine(this)
+
+                  executor.execute {
+                      val isSuccess = whisperEngine.initialize()
+                      runOnUiThread {
+                          if (!isSuccess) {
+                              Toast.makeText(this, "মডেল লোড করতে ব্যর্থ হয়েছে!", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+
+                  audioRecorder = AudioRecorder { samples ->
+                      if (isTranscribing) {
+                          executor.execute {
+                              val text = whisperEngine.transcribe(samples)
+                              if (text.isNotBlank()) {
+                                  runOnUiThread {
+                                      tvResult.append(" $text")
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  btnToggle.setOnClickListener {
+                      if (checkPermissions()) {
+                          toggleTranscription()
+                      } else {
+                          requestPermissions()
+                      }
+                  }
+              }
+
+              private fun toggleTranscription() {
+                  if (isTranscribing) {
+                      isTranscribing = false
+                      audioRecorder.stopRecording()
+                      btnToggle.text = "শুরু করুন"
+                      tvStatus.text = "বন্ধ আছে। শুরু করতে চাপুন।"
+                  } else {
+                      isTranscribing = true
+                      audioRecorder.startRecording()
+                      btnToggle.text = "বন্ধ করুন"
+                      tvStatus.text = "শোনা হচ্ছে... কথা বললে টেক্সট নিচে দেখা যাবে।"
+                  }
+              }
+
+              private fun checkPermissions(): Boolean {
+                  return ContextCompat.checkSelfPermission(
+                      this, Manifest.permission.RECORD_AUDIO
+                  ) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun requestPermissions() {
+                  ActivityCompat.requestPermissions(
+                      this,
+                      arrayOf(Manifest.permission.RECORD_AUDIO),
+                      PERMISSION_REQUEST_CODE
+                  )
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == PERMISSION_REQUEST_CODE && grantResults.isNotEmpty() &&
+                      grantResults[0] == PackageManager.PERMISSION_GRANTED
+                  ) {
+                      toggleTranscription()
+                  } else {
+                      Toast.makeText(this, "মাইক্রোফোন পারমিশন প্রয়োজন", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  audioRecorder.stopRecording()
+                  whisperEngine.release()
+                  executor.shutdown()
+              }
+          }
+          EOF
+
+          # activity_main.xml
+          cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="20dp"
+              android:backgroundColor="#FAFAFA">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="বাংলা কল ট্রান্সক্রাইবার"
+                  android:textSize="26sp"
+                  android:textStyle="bold"
+                  android:textColor="#4A4A4A"
+                  android:layout_marginTop="20dp" />
+
+              <TextView
+                  android:id="@+id/tvStatus"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="শোনা হচ্ছে... কথা বললে টেক্সট নিচে দেখা যাবে।"
+                  android:textSize="15sp"
+                  android:textColor="#757575"
+                  android:layout_marginTop="10dp"
+                  android:layout_marginBottom="25dp" />
+
+              <Button
+                  android:id="@+id/btnToggle"
+                  android:layout_width="match_parent"
+                  android:layout_height="55dp"
+                  android:text="বন্ধ করুন"
+                  android:textColor="#FFFFFF"
+                  android:textSize="18sp"
+                  android:textStyle="bold"
+                  android:backgroundTint="#6200EE"
+                  android:textAllCaps="false" />
+
+              <ScrollView
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:layout_marginTop="20dp"
+                  android:background="#EDEDED"
+                  android:padding="15dp">
+
+                  <TextView
+                      android:id="@+id/tvResult"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text=""
+                      android:textColor="#000000"
+                      android:textSize="16sp"
+                      android:lineSpacingExtra="4dp" />
+              </ScrollView>
+
+          </LinearLayout>
+          EOF
+
+          # whisper_native.cpp
+          cat << 'EOF' > app/src/main/cpp/whisper_native.cpp
+          #include <jni.h>
+          #include <string>
+          #include <vector>
+          #include "whisper.cpp/whisper.h"
+
+          extern "C" {
+
+          JNIEXPORT jlong JNICALL
+          Java_com_example_banglacalltranscriber_WhisperEngine_initNativeModel(
+                  JNIEnv *env, jobject thiz, jstring model_path_str) {
+
+              const char *model_path = env->GetStringUTFChars(model_path_str, nullptr);
+              struct whisper_context_params cparams = whisper_context_default_params();
+
+              struct whisper_context *ctx = whisper_init_from_file_with_params(model_path, cparams);
+              env->ReleaseStringUTFChars(model_path_str, model_path);
+
+              return reinterpret_cast<jlong>(ctx);
+          }
+
+          JNIEXPORT jstring JNICALL
+          Java_com_example_banglacalltranscriber_WhisperEngine_transcribeNative(
+                  JNIEnv *env, jobject thiz, jlong context_ptr, jfloatArray samples_array) {
+
+              auto *ctx = reinterpret_cast<struct whisper_context *>(context_ptr);
+              if (!ctx) return env->NewStringUTF("");
+
+              jsize len = env->GetArrayLength(samples_array);
+              jfloat *samples = env->GetFloatArrayElements(samples_array, nullptr);
+
+              whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+              params.print_progress = false;
+              params.print_special = false;
+              params.print_realtime = false;
+              params.print_timestamps = false;
+              params.language = "bn";
+
+              std::string result = "";
+              if (whisper_full(ctx, params, samples, len) == 0) {
+                  int n_segments = whisper_full_n_segments(ctx);
+                  for (int i = 0; i < n_segments; ++i) {
+                      const char *text = whisper_full_get_segment_text(ctx, i);
+                      result += text;
+                  }
+              }
+
+              env->ReleaseFloatArrayElements(samples_array, samples, 0);
+              return env->NewStringUTF(result.c_str());
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_example_banglacalltranscriber_WhisperEngine_freeNativeModel(
+                  JNIEnv *env, jobject thiz, jlong context_ptr) {
+              auto *ctx = reinterpret_cast<struct whisper_context *>(context_ptr);
+              if (ctx) {
+                  whisper_free(ctx);
+              }
+          }
+
+          }
+          EOF
+
+          # CMakeLists.txt
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("banglacalltranscriber")
+
+          set(WHISPER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/whisper.cpp)
+
+          add_subdirectory(${WHISPER_DIR} whisper.build)
+
+          add_library(
+                  whisper_native
+                  SHARED
+                  whisper_native.cpp
+          )
+
+          target_include_directories(
+                  whisper_native
+                  PRIVATE
+                  ${WHISPER_DIR}
+          )
+
+          target_link_libraries(
+                  whisper_native
+                  whisper
+                  log
+          )
+          EOF
+
+      # ২. whisper.cpp clone করা
       - name: whisper.cpp clone করা
         run: |
           rm -rf app/src/main/cpp/whisper.cpp
           git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
 
-          test -f app/src/main/cpp/whisper.cpp/CMakeLists.txt
-          test -f app/src/main/cpp/whisper.cpp/models/convert-h5-to-ggml.py
-
-          echo "whisper.cpp files:"
-          ls -la app/src/main/cpp/whisper.cpp/models | head -40
-
+      # ৩. Environment setup
       - name: JDK 17 সেটআপ
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
 
       - name: Android SDK সেটআপ
@@ -50,31 +487,12 @@ jobs:
           python-version: '3.10'
           cache: pip
 
-      # IMPORTANT:
-      # বর্তমান whisper.cpp-এ requirements-convert-hf-to-ggml.txt নেই।
-      # তাই সেই ফাইল install করা যাবে না। Converter-এর প্রয়োজনীয় package সরাসরি install করা হচ্ছে।
+      # ৪. Model Download ও Conversion
       - name: Model conversion dependencies ইনস্টল
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            "numpy<2" \
-            "transformers==4.30.1" \
-            "huggingface_hub" \
-            "safetensors" \
-            "sentencepiece" \
-            "accelerate"
-
-          # CPU PyTorch: GitHub runner-এ conversion-এর জন্য যথেষ্ট।
+          pip install "numpy<2" "transformers==4.30.1" "huggingface_hub" "safetensors" "sentencepiece" "accelerate"
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-          python - <<'PY'
-          import torch
-          import transformers
-          import numpy
-          print("torch:", torch.__version__)
-          print("transformers:", transformers.__version__)
-          print("numpy:", numpy.__version__)
-          PY
 
       - name: বাংলা Whisper model download করা
         env:
@@ -82,74 +500,40 @@ jobs:
         run: |
           rm -rf hf_model
           mkdir -p hf_model
-
           python - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
           model = os.environ["HF_MODEL"]
-
-          # Training/checkpoint files (optimizer, rng_state, scheduler, etc.)
-          # download না করে শুধু inference/conversion-এর প্রয়োজনীয় files নেওয়া হচ্ছে।
           snapshot_download(
               repo_id=model,
               local_dir="./hf_model",
               allow_patterns=[
-                  "config.json",
-                  "generation_config.json",
-                  "preprocessor_config.json",
-                  "special_tokens_map.json",
-                  "tokenizer_config.json",
-                  "vocab.json",
-                  "merges.txt",
-                  "normalizer.json",
-                  "added_tokens.json",
-                  "model.safetensors",
+                  "config.json", "generation_config.json", "preprocessor_config.json",
+                  "special_tokens_map.json", "tokenizer_config.json", "vocab.json",
+                  "merges.txt", "normalizer.json", "added_tokens.json", "model.safetensors",
               ],
           )
           PY
-
-          echo "Downloaded model files:"
-          ls -lah hf_model
-
-          # Converter-এর জন্য আবশ্যিক files আছে কি না যাচাই।
-          test -s hf_model/config.json
-          test -s hf_model/vocab.json
-          test -s hf_model/added_tokens.json
-          test -s hf_model/model.safetensors
 
       - name: OpenAI Whisper repository clone করা
         run: |
           rm -rf openai-whisper
           git clone --depth 1 https://github.com/openai/whisper.git openai-whisper
-          test -f openai-whisper/whisper/assets/mel_filters.npz
 
       - name: বাংলা Whisper model GGML-এ convert করা
         run: |
           rm -rf models_work
           mkdir -p models_work
-
-          # বর্তমান convert-h5-to-ggml.py-এর official argument order:
-          # 1) HF model directory
-          # 2) OpenAI whisper repository
-          # 3) output directory
-          python app/src/main/cpp/whisper.cpp/models/convert-h5-to-ggml.py \
-            ./hf_model \
-            ./openai-whisper \
-            ./models_work
-
-          test -s models_work/ggml-model.bin
+          python app/src/main/cpp/whisper.cpp/models/convert-h5-to-ggml.py ./hf_model ./openai-whisper ./models_work
           cp models_work/ggml-model.bin ./bangla-whisper.bin
-
-          echo "Converted model:"
-          ls -lh bangla-whisper.bin
 
       - name: Model assets-এ copy করা
         run: |
           mkdir -p app/src/main/assets/models
           cp bangla-whisper.bin app/src/main/assets/models/bangla-whisper.bin
-          ls -lh app/src/main/assets/models/bangla-whisper.bin
 
+      # ৫. Build & Upload
       - name: Gradle wrapper executable করা
         run: |
           if [ ! -f gradlew ]; then
@@ -169,3 +553,4 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+

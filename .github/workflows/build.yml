@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: কোড চেকআউট করা
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ১. whisper.cpp clone করা
       - name: whisper.cpp clone করা
@@ -370,7 +370,7 @@ jobs:
           </LinearLayout>
           EOF
 
-          # Fixed Native C++ Wrapper for Whisper.cpp
+          # Native C++ Wrapper
           cat << 'EOF' > app/src/main/cpp/whisper_native.cpp
           #include <jni.h>
           #include <string>
@@ -466,7 +466,7 @@ jobs:
 
       # ৩. Environment setup
       - name: JDK 17 সেটআপ
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -481,7 +481,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
 
       - name: Python 3.10 সেটআপ
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 

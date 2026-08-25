@@ -1,4 +1,4 @@
-name: Build and Fix Bangla Call Transcriber APK
+name: Build Bangla Call Transcriber APK
 
 on:
   workflow_dispatch:
@@ -14,10 +14,15 @@ jobs:
       - name: কোড চেকআউট করা
         uses: actions/checkout@v4
 
-      # ১. Android Project-এর প্রয়োজনীয় কোড ফাইলগুলো স্বয়ংক্রিয়ভাবে তৈরি / ওভাররাইট করা
+      # ১. whisper.cpp clone করা
+      - name: whisper.cpp clone করা
+        run: |
+          rm -rf app/src/main/cpp/whisper.cpp
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
+
+      # ২. প্রয়োজনীয় প্রজেক্ট ফাইল তৈরি ও আপডেট করা
       - name: প্রজেক্ট ফাইলসমূহ তৈরি ও আপডেট করা
         run: |
-          # ডিরেক্টরি তৈরি
           mkdir -p app/src/main/java/com/example/banglacalltranscriber
           mkdir -p app/src/main/res/layout
           mkdir -p app/src/main/cpp
@@ -48,7 +53,6 @@ jobs:
                       </intent-filter>
                   </activity>
               </application>
-
           </manifest>
           EOF
 
@@ -240,7 +244,7 @@ jobs:
                               val text = whisperEngine.transcribe(samples)
                               if (text.isNotBlank()) {
                                   runOnUiThread {
-                                      tvResult.append(" $text")
+                                      tvResult.append(" " + text)
                                   }
                               }
                           }
@@ -363,16 +367,15 @@ jobs:
                       android:textSize="16sp"
                       android:lineSpacingExtra="4dp" />
               </ScrollView>
-
           </LinearLayout>
           EOF
 
-          # whisper_native.cpp
+          # Fixed Native C++ Wrapper for Whisper.cpp
           cat << 'EOF' > app/src/main/cpp/whisper_native.cpp
           #include <jni.h>
           #include <string>
           #include <vector>
-          #include "whisper.cpp/whisper.h"
+          #include "whisper.h"
 
           extern "C" {
 
@@ -411,7 +414,9 @@ jobs:
                   int n_segments = whisper_full_n_segments(ctx);
                   for (int i = 0; i < n_segments; ++i) {
                       const char *text = whisper_full_get_segment_text(ctx, i);
-                      result += text;
+                      if (text) {
+                          result += text;
+                      }
                   }
               }
 
@@ -437,7 +442,6 @@ jobs:
           project("banglacalltranscriber")
 
           set(WHISPER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/whisper.cpp)
-
           add_subdirectory(${WHISPER_DIR} whisper.build)
 
           add_library(
@@ -449,6 +453,7 @@ jobs:
           target_include_directories(
                   whisper_native
                   PRIVATE
+                  ${WHISPER_DIR}/include
                   ${WHISPER_DIR}
           )
 
@@ -458,12 +463,6 @@ jobs:
                   log
           )
           EOF
-
-      # ২. whisper.cpp clone করা
-      - name: whisper.cpp clone করা
-        run: |
-          rm -rf app/src/main/cpp/whisper.cpp
-          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp
 
       # ৩. Environment setup
       - name: JDK 17 সেটআপ
@@ -485,7 +484,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: pip
 
       # ৪. Model Download ও Conversion
       - name: Model conversion dependencies ইনস্টল
@@ -553,4 +551,3 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
-
